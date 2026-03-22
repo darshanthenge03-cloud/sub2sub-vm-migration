@@ -1,0 +1,132 @@
+name: Sub2Sub VM Migration
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "Phase to execute"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - validate
+          - backup
+          - prepare
+          - move
+          - post
+          - backupsetup
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  migration:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read Config
+        run: |
+          echo "SOURCE_SUB=$(jq -r .sourceSubscription config/migration-config.json)" >> $GITHUB_ENV
+          echo "DEST_SUB=$(jq -r .destinationSubscription config/migration-config.json)" >> $GITHUB_ENV
+          echo "RG=$(jq -r .resourceGroup config/migration-config.json)" >> $GITHUB_ENV
+          echo "VM=$(jq -r .vmName config/migration-config.json)" >> $GITHUB_ENV
+          echo "VAULT=$(jq -r .sourceVaultName config/migration-config.json)" >> $GITHUB_ENV
+          echo "DEST_REGION=$(jq -r .destinationRegion config/migration-config.json)" >> $GITHUB_ENV
+          
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.DEST_SUB }}
+          enable-AzPSSession: true
+
+      - name: Install Az Module
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+          if (-not (Get-PSRepository -Name "PSGallery" -ErrorAction SilentlyContinue)) {
+              Register-PSRepository -Default -ErrorAction Stop
+          }
+          Install-Module Az -Repository PSGallery -Force -Scope CurrentUser -AllowClobber
+          Import-Module Az -Force
+
+      - name: Run PowerShell Phases
+        if: ${{ github.event.inputs.phase != 'backupsetup' }}
+        shell: pwsh
+        run: |
+          ./scripts/main.ps1 `
+            -SourceSubscription "$env:SOURCE_SUB" `
+            -DestinationSubscription "$env:DEST_SUB" `
+            -ResourceGroup "$env:RG" `
+            -VMName "$env:VM" `
+            -SourceVaultName "$env:VAULT" `
+            -Phase "${{ github.event.inputs.phase }}"
+
+      - name: Get VM ID
+        if: ${{ github.event.inputs.phase == 'backupsetup' }}
+        id: get_vm
+        shell: pwsh
+        run: |
+          $vm = Get-AzVM -Name "$env:VM" -ResourceGroupName "$env:RG"
+          echo "vm_id=$($vm.Id)" >> $env:GITHUB_OUTPUT
+
+      - name: Generate Unique Suffix
+        if: ${{ github.event.inputs.phase == 'backupsetup' }}
+        id: suffix
+        shell: pwsh
+        run: |
+          $suffix = Get-Date -Format "yyyyMMddHHmmss"
+          echo "suffix=$suffix" >> $env:GITHUB_OUTPUT
+
+      - name: Setup Terraform
+        if: ${{ github.event.inputs.phase == 'backupsetup' }}
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        if: ${{ github.event.inputs.phase == 'backupsetup' }}
+        working-directory: terraform
+        run: |
+          terraform init -upgrade -reconfigure
+
+      - name: Terraform Version
+        if: ${{ github.event.inputs.phase == 'backupsetup' }}
+        working-directory: terraform
+        run: terraform version
+
+      - name: Terraform Apply Backup
+        if: ${{ github.event.inputs.phase == 'backupsetup' }}
+        working-directory: terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="vm_name=${{ env.VM }}" \
+            -var="resource_group=${{ env.RG }}" \
+            -var="location=${{ env.DEST_REGION }}" \
+            -var="unique_suffix=${{ steps.suffix.outputs.suffix }}"
+            
+      # ---------------------------
+      # Azure CLI Backup Steps
+      # ---------------------------
+      
+      - name: Enable Backup for VM
+        if: ${{ github.event.inputs.phase == 'backupsetup' }}
+        run: |
+          az backup protection enable-for-vm \
+            --resource-group $RG \
+            --vault-name ${VM}-rsv-${{ steps.suffix.outputs.suffix }} \
+            --vm $VM \
+            --policy-name ${VM}-daily-11am-policy
+
+      - name: Trigger Initial Backup
+        if: ${{ github.event.inputs.phase == 'backupsetup' }}
+        run: |
+          az backup protection backup-now \
+            --resource-group $RG \
+            --vault-name ${VM}-rsv-${{ steps.suffix.outputs.suffix }} \
+            --container-name $VM \
+            --item-name $VM \
+            --backup-management-type AzureIaasVM
